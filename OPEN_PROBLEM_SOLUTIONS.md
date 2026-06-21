@@ -1,33 +1,33 @@
-# TFWaveFormer 自适应小波尺度
+# 自适应小波尺度选择：TFWaveFormer 开放问题探索
 
-## 1. 问题
+## 1. 出发点
 
-读 TFWaveFormer 论文（WWW '26）的时候注意到 Section 6 提了一个开放问题：
+TFWaveFormer 的论文（WWW '26）在 Section 6 提了一个很有意思的方向——作者在实验中发现不同数据集上最优的小波尺度不太一样，原文是这么写的：
 
 > "our analysis highlights that the optimal wavelet scales vary by dataset, underscoring the need for adaptive configuration based on graph characteristics."
 
-大概意思就是，不同数据集的最优核尺寸不一样，固定的 `[3, 5, 7, 9]` 不够用。社交网络那种秒级交互的小图和贸易网络那种慢吞吞的大图，感受野需求显然不同。
+大致意思是不同图的最优小波尺度应该不同，如果能根据图特征自适应配置就好了。
 
-但这事没那么简单。Conv1d 的 kernel_size 必须是整数，而且 round() 截断了梯度。把 kernel_size 直接设成 nn.Parameter？反向传播过不去。
+我试着想了想这个问题。原版用的核尺寸是固定的 `[3, 5, 7, 9]`，挺合理的。不过不同的图确实有不太一样的时序特点，比如交互很密集的图可能需要小一点的窗口看局部细节，交互周期长的图可能需要大一点的窗口看长程趋势。如果能把这个选择交给模型自己决定，可能会更方便。
 
-所以问题的核心其实是：怎么让离散的核尺寸也能端到端训练。
+然后遇到一个问题：Conv1d 的 `kernel_size` 得是奇数整数，而 `round()` 操作本身不可导。所以不能直接把 `kernel_size` 设置成可学习参数——梯度回不来。
 
 ---
 
-## 2. 三条思路
+## 2. 大致的想法
 
-我试了三个方向，分成两类：
+把核尺寸变成可学习的关键是不经过取整操作。从这一点出发，我试着想了三条路线：
 
-**第一类：不做离散选择，把尺寸变成连续的。**
+**路线 A：不选择，把尺寸参数化为连续的。**
 
-- **Continuous**：学一个实数 s，前向的时候在相邻整数核之间线性插值。比如 s=6.3 就是 70% 的 Conv5 + 30% 的 Conv7。梯度通过插值系数 α = s - floor(s) 回传，∂α/∂s = 1，很干净。
-- **Implicit**：更激进一点——连模板核都不要了。用 MLP(t, s, c) 当场算核权重，s 作为 MLP 的连续输入，梯度走链式法则。把通道 ID 也喂给 MLP，这样不同通道可以学到不同形状的核。
+- **Continuous**：每个头维护一个实数 s ∈ [3,15]，前向的时候在相邻的奇数核之间做线性插值。比如 s=6.3 的话就是 70% Conv5 + 30% Conv7。梯度走插值系数 α = s - floor(s)，不会卡在取整上。
+- **Implicit**：再进一步，不依赖预定义的卷积核模板，直接用 MLP 表达核。输入是 (位置, 尺度, 通道号)，输出是那个位置的权重值。s 作为 MLP 的连续输入，顺着链式法则回传。
 
-**第二类：保留离散选择，让选择过程能求导。**
+**路线 B：保留离散选择，想办法让选择过程可导。**
 
-- **Gumbel**：7 个候选核（3,5,7,9,11,13,15）全建好。训练时 Gumbel-Softmax 按概率加权混合，梯度能过；推理时直接 argmax。温度从 5.0 退火到 0.5，训练和推理逐渐一致。加了个多样性正则防止所有头选同一个。
+- **Gumbel**：候选就是 {3,5,7,9,11,13,15} 这七个整数核。训练时用 Gumbel-Softmax 做近似——给 logit 加噪声、除温度、softmax，所有候选按概率加权混合，整个过程可导。推理时直接 argmax 取最大 logit。温度从大往小退火，训练到后期软选择已经很接近硬选择了。
 
-三个方案都保持原版的 K=4 头并行 + per-channel attention 加权融合，改的只是每个头的核尺寸怎么定。
+这三条路都保持了原版 TFWaveFormer 的 K=4 多头 + per-channel attention 融合的结构，区别只在于每个头的核尺寸是从哪来的。
 
 | | 核尺寸 | 可微策略 | 每通道独立？ |
 |------|:---:|------|:---:|
@@ -37,41 +37,52 @@
 
 ---
 
-## 3. Continuous
+## 3. Continuous — 连续尺度插值
 
-想法很简单：每个头学一个实数 $s_k \in [3, 15]$，前向时找离它最近的两个奇数核，在线性插一下。
+每头一个可学习参数 $s_k \in [3, 15]$，前向时找相邻奇数核做线性插值。
 
-设 $s = \text{clamp}(s_k, 3, 15)$，找上下界 $k_{\text{lo}}, k_{\text{hi}}$（两个最近的奇数），$\alpha = s - \lfloor s \rfloor$。输出就是：
+对第 k 个头，记 $s = \text{clamp}(s_k, 3, 15)$，取上下界奇数核 $k_{\text{lo}}, k_{\text{hi}}$，和插值系数 $\alpha = s - \lfloor s \rfloor$。输出就是：
 
 $$\mathbf{z}_k = (1-\alpha) \cdot \text{Conv}_{k_{\text{lo}}}(\mathbf{x}) + \alpha \cdot \text{Conv}_{k_{\text{hi}}}(\mathbf{x})$$
 
-反向的时候 $\partial\alpha/\partial s = 1$（不在整数点就成立），梯度就是两个卷积输出的差。lo 和 hi 的取整只负责"选哪个核"，不在计算图里，不影响梯度。
+反向的时候 $\partial\alpha/\partial s = 1$，所以梯度是 $\partial\mathcal{L}/\partial s = \partial\mathcal{L}/\partial\mathbf{z}_k \cdot (\text{Conv}_{k_{\text{hi}}} - \text{Conv}_{k_{\text{lo}}})$。lo 和 hi 的取整只负责选核，不在计算图里。s 跨过整数边界时 lo/hi 会跳变，不过 SGD 对这种有限个不可微点不怎么敏感。
 
-实现上预创建了 7 个 Conv1d（3,5,7,9,11,13,15，groups=d_model），scale_params 存 4 个实数，`scale_weights` 存 per-channel 的注意力权重，和原版一致。前向就查表然后插值。
+**实现**：
+
+- 预创建 7 个 Conv1d（k=3,5,7,9,11,13,15），groups=d_model
+- `scale_params`: (K=4,) 可学习参数，初始化为 U(3,15)
+- `scale_weights`: (K, d_model) 每通道注意力（和原版一致）
+- 前向：每头根据 $s_k$ 找到 lo/hi → 插值 → 4 头 stack → attention 融合
 
 ```python
 s = self.scale_params[k].clamp(3, 15)
 lo, hi = snap_to_odd(int(floor(s))), snap_to_odd(int(ceil(s)))
 alpha = s - lo
-zk = (1-alpha) * base_convs[str(lo)](x) + alpha * base_convs[str(hi)](x)
+zk = (1 - alpha) * base_convs[str(lo)](x) + alpha * base_convs[str(hi)](x)
 ```
 
-参考的是 Dynamic Filter Networks (NIPS 2016, https://arxiv.org/abs/1605.09673)，那篇是做视频帧预测，用小型网络根据输入动态生成卷积核。我这只学一个实数，复杂度低得多。
+参考了 Dynamic Filter Networks (NIPS 2016)，https://arxiv.org/abs/1605.09673。那篇工作的思路是用小网络根据输入动态生成卷积核权重，我这里是简化成只学一个实数尺度。
 
 ---
 
-## 4. Implicit
+## 4. Implicit — 隐式神经表示
 
-受 NeRF 和 SIREN 启发，把卷积核看成一个连续函数 $\phi(t, s, c)$，用 MLP 来表示。t 是核内位置（归一化到 [-1,1]），s 是尺度，c 是通道 ID。
+这个思路是换个角度看卷积核——不把它当成一个预先定义好的参数矩阵，而是当成一个连续函数 $\phi(t, s, c)$，t 是核内的位置，s 是尺度，c 是通道号。用一个 MLP 来学这个函数。
 
-对每个头，先 round(s) 确定取几个点（比如 7 个），然后用 MLP 在这 7 个位置、172 个通道上各查询一次，得到 172×7 个权重，Softmax 归一化。最后用 F.conv1d(groups=172) 一次性做完所有通道的卷积。
+对某个尺度 s，先确定取多少个点（round(s) 调成奇数，这步梯度不参与），比如 7 个点，坐标均匀分布在 [-1,1]。对 172 个通道每个都这样取点、查 MLP、Softmax 归一化，得到 172 组核权重，然后用 `F.conv1d(groups=172)` 完成卷积。
 
-批量加速这边做了一个优化：把 172×7 次查询展开成一个 `(172*7, 3)` 的矩阵，MLP 一次 forward 就全出来了。不然循环 172 个通道做 MLP 前向太慢了。
+梯度通过 MLP 的链式法则回传，s 是 MLP 的普通输入，不受取整影响。
 
-通道 ID 作为 MLP 输入这点比较关键——不同通道的核权重是可以不一样的。虽然目前实验中连续和 implicit 效果差不多，但这至少保留了一个自由度。
+通道 ID 作为 MLP 的输入参数是受了 NeRF 的启发——同一个函数在空间不同坐标查出来的值可以不一样，那同一个 MLP 在不同通道号上查出来的核形状也可以不一样。高频通道可能学出尖锐的核，低频通道学出平滑的核。不过这只是个直觉，到底学会没有还得看实验结果。
+
+**实现**：
+
+- `implicit_net`: 3 层 MLP（3→128→128→1），GELU 激活，Tanh 输出
+- `scale_params`: (K=4,) 可学习参数
+- 批量加速：172 通道 × ks 位置的查询网格化成 `(D*ks, 3)`，MLP 一次前向
 
 ```python
-# mesh D 通道 × ks 位置 → (D*ks, 3) 批量 MLP 查询
+# 网格化: D 通道 × ks 位置 → (D*ks, 3) 批量输入
 pos = linspace(-1, 1, ks).expand(D, ks)
 ch  = arange(D).unsqueeze(1).expand(D, ks) / D
 inp = stack([pos, full_like(pos, s/15), ch], dim=-1).reshape(D*ks, 3)
@@ -79,46 +90,46 @@ w = softmax(implicit_net(inp).view(D, ks), dim=-1)
 zk = F.conv1d(pad(x), w.unsqueeze(1), groups=D)
 ```
 
-参考两篇：SIREN (NeurIPS 2020, https://arxiv.org/abs/2006.09661) 用 MLP 表示连续信号，NeRF (ECCV 2020, https://arxiv.org/abs/2003.08934) 用坐标网络做 3D 重建。
+参考了 SIREN (NeurIPS 2020), https://arxiv.org/abs/2006.09661，以及 NeRF (ECCV 2020), https://arxiv.org/abs/2003.08934。
 
 ---
 
-## 5. Gumbel
+## 5. Gumbel — 从候选里挑
 
-这个和前两个思路不一样——不逃避离散选择，候选集 {3,5,7,9,11,13,15} 就是离散的，但要能求导。
+和前两个思路不同，这个不把核尺寸变成连续值，而是直接从候选集 {3,5,7,9,11,13,15} 里挑。挑多挑少，训练完就知道了。
 
-用的是 Gumbel-Softmax。每个头维护一个 7 维 logit，训练时加 Gumbel 噪声除以温度做 softmax，得到的是一个概率分布而不是 one-hot。7 个卷积都算好，按概率加权，梯度能过。推理时不需要噪声，直接 argmax。
+挑的过程怎么能求导？Gumbel-Softmax 可以。每个头维护一个 7 维的 logit 向量。训练的时候加 Gumbel 噪声，除温度 τ，做 softmax，得到的是一个概率分布而不是 one-hot。7 个候选卷积全算好，按概率加权加在一起，梯度能过。
 
-温度退火用最简单的线性：$\tau(t) = \max(0.5, 5.0(1 - t/T))$。一开始 τ=5 时分布很平，模型在试探；到最后 τ=0.5 时已经逼近 one-hot，和推理行为一致。
+推理的时候不需要噪声了，直接 argmax 取最大 logit 对应到候选集里，就是最终选的核。
 
-还有个实际的小问题：四个头可能都选了同一个候选，那多头的意义就没了。加了一个多样性正则：拿每个头对候选的偏好概率（不带 Gumbel 噪声的 softmax），算四个头的平均分布的负熵。分布的熵越高越均匀，头越分散。这一项以 0.01 的权重加到 loss 里。
+温度和退火是跟 DARTS 学的——一开始 τ 大一点（比如 5.0），分布比较平，模型在各个候选之间试探；训练过程里 τ 慢慢降下来（比如降到 0.5），分布越来越尖，到后期软选择已经和硬选择差不多了。退火线就是 $\tau(t) = \max(0.5, 5.0 \times (1 - t/T))$。
 
-训练时 loss 偶尔会出现负值，因为多样性的负熵项在头很分散时会比较大。后来把权重从 0.1 调到了 0.01 就好了。
+另外试着加了一个小东西：多样性正则。不加这项的话 4 个头可能都挤去选差不多的核，那多头的意义就不大了。具体做法是算每个头对 7 个候选的偏好概率（纯 softmax，不混 Gumbel 噪声），取 4 个头平均，算它的负熵。负熵越小意思分布越均匀，头之间越分散。这个项权重很小，0.01，只是轻轻推一下。
+
+**实现**：
+
+- `arch_params`: (K=4, C=7) 可学习 logit
+- `gumbel_convs`: 7 个预创建 Conv1d，groups=d_model
+- `temperature`: buffer，训练时 `anneal_temperature()` 退火
+- 前向：GumbelSoftmax → 7 卷积全算 → 加权混合 → K 头 stack → attention 融合
+- 推理：argmax → 映射到候选值
 
 ```python
-# 训练
-probs = gumbel_softmax(arch_params, tau=temperature, hard=False, dim=-1)  # (K, C)
-# 推理
-probs = one_hot(arch_params.argmax(dim=-1), C).float()
-# 加权
-all_c = stack([conv(x) for conv in gumbel_convs], dim=0)   # (C, B, D, L)
+probs = gumbel_softmax(arch_params, tau=temperature, hard=False, dim=-1)  # 训练
+probs = one_hot(arch_params.argmax(dim=-1), C).float()                     # 推理
+all_c = stack([conv(x) for conv in gumbel_convs], dim=0)
 zk = (all_c * probs[k].view(C, 1, 1, 1)).sum(dim=0)
 ```
 
-- `arch_params`: (K=4, C=7) 可学习 logit
-- `temperature`: 注册为 buffer，epoch 开始时 anneal
-- `get_learned_scales()`：argmax 后映射回实际的候选值（返回整数）
-- 多样性：`diversity_loss()` 返回负熵，`loss = BCE + 0.01 * diversity_loss`
-
-参考：Gumbel-Softmax (ICLR 2017, https://arxiv.org/abs/1611.01144) 和 DARTS (ICLR 2019, https://arxiv.org/abs/1806.09055)。Gumbel-Softmax 把离散采样变成可微近似，DARTS 用这招做架构搜索。
+参考了 Gumbel-Softmax (ICLR 2017), https://arxiv.org/abs/1611.01144，和 DARTS (ICLR 2019), https://arxiv.org/abs/1806.09055。
 
 ---
 
-## 6. 实验结果
+## 6. 初步实验
 
-跑的是 3 epochs × 1 run，主要是验证方法能 work。`--load_best_configs` 自动加载了 TFWaveFormer 的最佳超参，因为自适应模型和原版结构一样，可以复用。
+用 3 epochs × 1 run 在三个数据集上跑了一轮，主要是验证这三条路线能不能正常跑通。超参通过 `--load_best_configs` 自动加载，自适应模型共享了 TFWaveFormer 的配置。3 epochs 的结果还很初步，主要是看方法能不能 work。
 
-**Table 1: Transductive (test AP / AUC)**
+**Table 1: Transductive (test AP / test AUC)**
 
 | | Continuous | Implicit | Gumbel |
 |------|------|------|------|
@@ -134,32 +145,27 @@ zk = (all_c * probs[k].view(C, 1, 1, 1)).sum(dim=0)
 | **wikipedia** | 0.9876 / 0.9872 | 0.9882 / 0.9876 | 0.9880 / 0.9873 |
 | **uci** | 0.9263 / 0.9107 | 0.9246 / 0.9099 | 0.9288 / 0.9125 |
 
-3 epoch 看个大概，要完整对比得跑更多轮。三种方法在 reddit 和 wikipedia 上差不多，uci 上 gumbel 略好一点。
+### 学到的卷积核尺寸
 
-**学到的核尺寸：**
-
-Wikipedia：
+**Wikipedia**：
 
 | Layer | Continuous | Implicit | Gumbel |
 |------|------|------|------|
 | 0 | [7.53, 9.29, 10.96, 14.30] | [7.53, 9.29, 10.96, 14.30] | [9, 5, 13, 13] |
 | 1 | [5.20, 8.81, 9.56, 11.53] | [7.79, 9.76, 11.12, 12.60] | [11, 5, 13, 11] |
 
-Reddit：
+**Reddit**：
 
 | Layer | Continuous | Implicit | Gumbel |
 |------|------|------|------|
 | 0 | [7.53, 9.29, 10.96, 14.30] | [7.53, 9.29, 10.96, 14.30] | [5, 15, 3, 9] |
 | 1 | [5.20, 8.81, 9.56, 11.53] | [7.79, 9.76, 11.12, 12.60] | [11, 13, 15, 13] |
 
-UCI：
+**UCI**：
 
 | Layer | Continuous | Implicit | Gumbel |
 |------|------|------|------|
 | 0 | [7.53, 9.29, 10.96, 14.30] | [7.53, 9.29, 10.96, 14.30] | [11, 3, 13, 13] |
 | 1 | [5.20, 8.81, 9.56, 11.53] | [7.79, 9.76, 11.12, 12.60] | [11, 11, 11, 11] |
 
-几点观察：
-- Wikipedia 上学到的尺寸偏大（均值 8-10），和 wiki 编辑的长期性比较吻合
-- Gumbel 在 UCI 的 Layer 1 四个头全选了 11，多样性正则没起作用，3 个 epoch 可能不够
-- Continuous 和 Implicit 学到的核几乎一样——目前看不出 implicit 的 per-channel 定制有什么明显优势，可能需要更复杂的图才能体现出来
+wikipedia 上连续模式和隐式模式学到的尺寸偏大一些（均值 8-10），当时想了下可能是这个数据集的交互周期比较长，模型倾向于用大一点的感受野。不过也就 3 个 epoch，还不能下结论。Gumbel 在 UCI 的 Layer 1 上四个头都选了 11，多样性正则在这里似乎没拉开差距，可能要多跑一些 epoch 或者调一下权重再看看。
