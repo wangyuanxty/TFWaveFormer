@@ -47,7 +47,8 @@ $$\mathbf{z}_k = (1-\alpha) \cdot \text{Conv}_{k_{\text{lo}}}(\mathbf{x}) + \alp
 
 由于 $\partial\alpha/\partial s = 1$，梯度为 
 
-$$\partial\mathcal{L}/\partial s = \partial\mathcal{L}/\partial\mathbf{z}_k \cdot (\text{Conv}_{k_{\text{hi}}} - \text{Conv}_{k_{\text{lo}}})$$。
+$$\partial\mathcal{L}/\partial s = \partial\mathcal{L}/\partial\mathbf{z}_k \cdot (\text{Conv}_{k_{\text{hi}}} - \text{Conv}_{k_{\text{lo}}})$$
+
 lo/hi 的取整仅用于索引预创建的卷积核，不参与计算图。
 
 **实现**：预创建 7 个 Conv1d（k=3,5,7,9,11,13,15），groups=d_model。`scale_params` 为 (K=4,) 可学习参数，初始化为 U(3,15)。
