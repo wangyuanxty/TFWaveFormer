@@ -3,6 +3,8 @@
 > 原论文：*TFWaveFormer: Temporal-Frequency Collaborative Multi-level Wavelet Transformer* (WWW '26)
 >
 > 原仓库：[SEUFHTong/TFWaveFormer](https://github.com/SEUFHTong/TFWaveFormer)
+>
+> 本仓库：[wangyuanxty/TFWaveFormer_copy](https://github.com/wangyuanxty/TFWaveFormer_copy)
 
 ## 动机
 
